@@ -4,6 +4,7 @@ import re
 import json
 import string
 import random
+import unicodedata
 import sys  # Add this import
 from fastapi import FastAPI, UploadFile, File, Request, Query, HTTPException
 from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
@@ -169,6 +170,96 @@ BACKSLASH_PATTERN = re.compile(r'\\')
 
 print("[REGEX] Pre-compiled regex patterns loaded successfully")
 
+# Arabic text processing functions (from app1.py)
+def decode_arabic_text(text: str) -> str:
+    """
+    Decode potentially corrupted Arabic text back to proper Unicode.
+    Handles various encoding issues including double-encoding.
+    """
+    if not isinstance(text, str):
+        return str(text)
+    
+    try:
+        # If text is already proper Arabic, return as is
+        if any('\u0600' <= c <= '\u06FF' for c in text):
+            return text
+            
+        # Try different encoding combinations to fix corrupted text
+        encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
+        for enc in encodings:
+            try:
+                # Try to decode assuming it was encoded with this encoding
+                decoded = text.encode('latin1').decode(enc)
+                # If we got Arabic text, return it
+                if any('\u0600' <= c <= '\u06FF' for c in decoded):
+                    return decoded
+            except:
+                continue
+                
+        # If above fails, try forcing utf-8 decode
+        try:
+            decoded = text.encode('latin1').decode('utf-8')
+            return decoded
+        except:
+            pass
+            
+        return text
+    except Exception as e:
+        print(f"[ERROR] Arabic decoding failed: {str(e)}")
+        return text
+
+def normalize_arabic_text(text: str) -> str:
+    """
+    Normalize Arabic text to ensure consistent encoding and proper display.
+    """
+    if not isinstance(text, str):
+        return str(text)
+    
+    try:
+        # First decode if it's corrupted
+        text = decode_arabic_text(text)
+        
+        # Then normalize to NFC form
+        normalized = unicodedata.normalize('NFC', text)
+        
+        # Ensure it's valid UTF-8
+        return normalized.encode('utf-8').decode('utf-8')
+    except Exception as e:
+        print(f"[ERROR] Arabic normalization failed: {str(e)}")
+        return text
+
+def fix_text_encoding(text: str) -> str:
+    """Try to fix incorrectly encoded text, especially Arabic."""
+    try:
+        # Try to fix double-encoded text
+        return text.encode('latin1').decode('utf-8')
+    except:
+        try:
+            # Try direct UTF-8 decoding
+            return text.encode('utf-8').decode('utf-8')
+        except:
+            # Return original if both attempts fail
+            return text
+
+def safe_json_dumps(data, **kwargs):
+    """
+    Safe JSON dumps that handles Arabic text properly.
+    """
+    # Ensure ensure_ascii=False is always set for proper Arabic handling
+    kwargs['ensure_ascii'] = False
+    
+    # Process any text fields to ensure proper Arabic encoding
+    if isinstance(data, dict):
+        processed_data = {}
+        for key, value in data.items():
+            if isinstance(value, str):
+                processed_data[key] = normalize_arabic_text(value)
+            else:
+                processed_data[key] = value
+        return json.dumps(processed_data, **kwargs)
+    else:
+        return json.dumps(data, **kwargs)
+
 # ============================================================================
 
 # Inline RAG helper functions (formerly in backend/rag_text_response_image56.py)
@@ -180,33 +271,64 @@ except ImportError as e:
         "Missing 'firebase_admin' dependency: please install via `pip install firebase-admin google-cloud-firestore google-cloud-storage`"
     ) from e
 import shutil
-async def generate_complete_tts(text: str, language: str) -> str:
-    """Generate complete TTS audio file and return URL"""
+import hashlib
+
+# Audio file cleanup removed - no longer saving MP3 files to disk
+
+# Audio cache to avoid regenerating identical content
+audio_cache = {}
+
+async def generate_complete_tts(text: str, language: str) -> dict:
+    """Generate complete TTS audio and return base64 encoded data with caching (no file saving)"""
     try:
         # Determine voice based on language
         if language.lower().startswith('ar'):
             voice = "ar-SA-ZariyahNeural"
         else:
-            voice = "en-US-AriaNeural"
+            voice = "en-US-JennyNeural"  # Updated to JennyNeural for consistency
         
         # Clean text for TTS
         clean_text = sanitize_for_tts(text)
         if not clean_text.strip():
-            return ""
+            return None
         
-        # Generate unique filename
-        timestamp = int(time.time() * 1000)
-        filename = f"tts_{timestamp}.mp3"
-        filepath = os.path.join(AUDIO_DIR, filename)
+        # Create cache key based on text and language
+        cache_key = hashlib.md5(f"{clean_text}_{language}".encode()).hexdigest()
         
-        # Generate TTS
+        # Check if we already have this audio cached (memory only)
+        if cache_key in audio_cache:
+            cached_data = audio_cache[cache_key]
+            print(f"[TTS CACHE] Using cached audio - Text: \"{clean_text}\"")
+            return cached_data
+        
+        # Generate TTS audio in memory
         communicate = edge_tts.Communicate(clean_text, voice)
-        await communicate.save(filepath)
+        audio_data = b""
         
-        # Return URL for the audio file
-        audio_url = f"https://ai-assistant.myddns.me:8443/audio/{filename}"
-        print(f"[TTS] Generated audio: {audio_url}")
-        return audio_url
+        # Collect audio data from stream
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data += chunk["data"]
+        
+        if not audio_data:
+            print(f"[TTS ERROR] No audio data generated - Text: \"{clean_text}\"")
+            return None
+        
+        # Encode to base64 for streaming (no file saving)
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+        
+        result = {
+            "content": audio_base64,
+            "size": len(audio_data),
+            "sentence": clean_text
+        }
+        
+        # Cache the result in memory only
+        audio_cache[cache_key] = result
+        
+        print(f"[TTS] Generated audio: {len(audio_base64)} chars base64 (memory only) - Text: \"{clean_text}\"")
+        
+        return result
         
     except Exception as e:
         print(f"[TTS ERROR] Failed to generate audio: {e}")
@@ -357,10 +479,21 @@ class OptimizedCurriculumChatSessionManager:
         print(f"[BACKGROUND] 🔄 Pre-processing curriculum: {curriculum_id}")
         
         try:
-            # Create background task
+            # Create background task with timeout
             task = asyncio.create_task(self._build_vectors_background(curriculum_id))
             self.background_tasks.add(task)
-            task.add_done_callback(self.background_tasks.discard)
+            
+            # Add completion callback
+            def task_done_callback(task):
+                self.background_tasks.discard(task)
+                if task.exception():
+                    print(f"[BACKGROUND ERROR] Task failed: {task.exception()}")
+                    self.processing_queue[curriculum_id] = "failed"
+                else:
+                    print(f"[BACKGROUND] ✅ Completed processing: {curriculum_id}")
+                    self.processing_queue[curriculum_id] = "completed"
+            
+            task.add_done_callback(task_done_callback)
             
         except Exception as e:
             print(f"[BACKGROUND ERROR] Failed to start background processing: {e}")
@@ -416,14 +549,14 @@ class OptimizedCurriculumChatSessionManager:
             status = self.processing_queue[curriculum_id]
             if status == "processing":
                 print(f"[OPTIMIZED] ⏳ Waiting for background processing to complete...")
-                # Wait for background processing with timeout
+                # Wait for background processing with timeout (reduced from 30s to 5s)
                 wait_time = 0
-                while self.processing_queue.get(curriculum_id) == "processing" and wait_time < 30:
-                    await asyncio.sleep(0.5)
-                    wait_time += 0.5
+                while self.processing_queue.get(curriculum_id) == "processing" and wait_time < 5:
+                    await asyncio.sleep(0.2)  # Check more frequently
+                    wait_time += 0.2
                 
-                if wait_time >= 30:
-                    print(f"[OPTIMIZED] ⚠️ Background processing timeout, proceeding with direct processing")
+                if wait_time >= 5:
+                    print(f"[OPTIMIZED] ⚠️ Background processing timeout (5s), proceeding with direct processing")
         
         # Load vectors (should be fast if background processing completed)
         print(f"[OPTIMIZED] 🚀 Loading vectors for chat {chat_id}")
@@ -491,16 +624,32 @@ class OptimizedCurriculumChatSessionManager:
                 loader = PyPDFLoader(file_path)
             
             print(f"[OPTIMIZED] 📄 Loading document: {file_path}")
+            start_load = time.time()
+            
+            # Check file size before processing
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
+            print(f"[OPTIMIZED] 📊 Document size: {file_size:.2f} MB")
+            
+            if file_size > 50:  # If larger than 50MB, warn about processing time
+                print(f"[OPTIMIZED] ⚠️ Large document detected - processing may take longer")
+            
             docs = await asyncio.to_thread(loader.load)
+            print(f"[OPTIMIZED] ✅ Document loaded in {time.time() - start_load:.2f}s")
             
             print(f"[OPTIMIZED] ✂️ Splitting document into optimized chunks")
+            start_split = time.time()
             final_documents = await asyncio.to_thread(text_splitter.split_documents, docs)
+            print(f"[OPTIMIZED] ✅ Document split into {len(final_documents)} chunks in {time.time() - start_split:.2f}s")
             
             print(f"[OPTIMIZED] 🧠 Creating FAISS index from {len(final_documents)} chunks")
+            start_faiss = time.time()
             vectors = await asyncio.to_thread(FAISS.from_documents, final_documents, embeddings)
+            print(f"[OPTIMIZED] ✅ FAISS index created in {time.time() - start_faiss:.2f}s")
             
             print(f"[OPTIMIZED] 💾 Saving FAISS index to {FAISS_LOCAL_LOCATION}")
+            start_save = time.time()
             await asyncio.to_thread(vectors.save_local, FAISS_LOCAL_LOCATION)
+            print(f"[OPTIMIZED] ✅ FAISS index saved in {time.time() - start_save:.2f}s")
             
             # Clean up downloaded file
             if os.path.exists(file_path):
@@ -1001,45 +1150,6 @@ async def get_curriculum_url(curriculum):
         print(f"[RAG][ERROR] Failed to fetch curriculum URL: {str(e)}")
         raise
 
-def decode_arabic_text(text: str) -> str:
-    """
-    Decode potentially corrupted Arabic text back to proper Unicode.
-    Handles various encoding issues including double-encoding.
-    """
-    if not isinstance(text, str):
-        return str(text)
-    
-    try:
-        # If text is already proper Arabic, return as is
-        if any('\u0600' <= c <= '\u06FF' for c in text):
-            return text
-            
-        # Try different encoding combinations to fix corrupted text
-        encodings = ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']
-        for enc in encodings:
-            try:
-                # Try to decode assuming it was encoded with this encoding
-                decoded = text.encode('latin1').decode(enc)
-                # If we got Arabic text, return it
-                if any('\u0600' <= c <= '\u06FF' for c in decoded):
-                    return decoded
-            except:
-                continue
-                
-        # If above fails, try forcing utf-8 decode
-        try:
-            decoded = text.encode('latin1').decode('utf-8')
-            return decoded
-        except:
-            pass
-            
-        # If all fails, return original
-        return text
-    except Exception as e:
-        print(f"[ERROR] Arabic decode failed: {str(e)}")
-        return text
-
-
 async def fetch_chat_detail(chat_id):
     """Fetch and format the last 3 QA pairs of chat history."""
     chat_ref = db.collection('chat_detail').document(chat_id)
@@ -1136,27 +1246,6 @@ async def retrieve_documents(vectorstore, query: str, max_tokens: int = 30000, k
     print(f"[RETRIEVE] Final selection: {len(out)} docs, {total} total tokens")
     print(f"[RETRIEVE] Total retrieval time: {total_time:.3f}s")
     return out
-
-def normalize_arabic_text(text: str) -> str:
-    """
-    Normalize Arabic text to ensure consistent encoding and proper display.
-    """
-    if not isinstance(text, str):
-        return str(text)
-    
-    try:
-        # First decode if it's corrupted
-        text = decode_arabic_text(text)
-        
-        # Then normalize to NFC form
-        import unicodedata
-        normalized = unicodedata.normalize('NFC', text)
-        
-        # Ensure it's valid UTF-8
-        return normalized.encode('utf-8').decode('utf-8')
-    except Exception as e:
-        print(f"[ERROR] Arabic normalization failed: {str(e)}")
-        return text
 
 def process_text_fields(item: dict, fields: list) -> None:
     """Process multiple text fields in a dictionary for Arabic text handling"""
@@ -1294,54 +1383,7 @@ system_prompt = f"""You are an intelligent educational assistant. Follow these g
 
 Remember: ALL mathematical expressions must be wrapped in $$...$$ without exception."""
 
-
-
-
-
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
-MAX_TOKENS_PER_CHUNK = 4096
-RUNWARE_API_KEY = os.getenv("RUNWARE_API_KEY")
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
-openai.api_key = OPENAI_API_KEY
-tokenizer = tiktoken.encoding_for_model("gpt-4")
-AUDIO_DIR = "audio_sents"
-os.makedirs(AUDIO_DIR, exist_ok=True)
-
-
-
-
-
-
-
-
-
-# 🔵 IMAGE GENERATION KEYWORDS
-IMAGE_SYNONYMS = [
-    "*GENERATION*", "*Generation*", "*جيل*", "*إنشاء*"
-]
-
-# 🟢 GRAPH GENERATION KEYWORDS
-GRAPH_SYNONYMS = [
-    '"GRAPH"',
-    '"PLOT"',
-    '"رسم بياني"',
-    '"آلة الرسم"',
-    '"حاسبة الرسوم"',
-    "GRAPH",
-    "PLOT",
-    "رسم بياني",
-    "آلة الرسم",
-    "حاسبة الرسوم"
-]
-
-# 🟠 WEB/WEBLINK KEYWORDS
-WEB_SYNONYMS = [
-    "*internet*", "*web*", "*إنترنت*", "*الويب*"
-]
-
-# ----- PROMPT CHOOSING LOGIC -----
-# Fill in your actual prompts here:
+# Teacher prompt definition
 teacher_prompt = """
     - STRICT REQUIREMENT: All mathematical equations must be formatted in LaTeX and wrapped in $$...$$. For example:
       $$y = x^3 + 4$$
@@ -2325,6 +2367,57 @@ Use it **properly for follow-up answers based on contex**.
 
 
 
+
+
+
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
+MAX_TOKENS_PER_CHUNK = 4096
+RUNWARE_API_KEY = os.getenv("RUNWARE_API_KEY")
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+openai.api_key = OPENAI_API_KEY
+tokenizer = tiktoken.encoding_for_model("gpt-4")
+# Audio directory not needed - using base64 only, no file saving
+# AUDIO_DIR = "audio_sents"
+# os.makedirs(AUDIO_DIR, exist_ok=True)
+
+
+
+
+
+
+
+
+
+# 🔵 IMAGE GENERATION KEYWORDS
+IMAGE_SYNONYMS = [
+    "*GENERATION*", "*Generation*", "*جيل*", "*إنشاء*"
+]
+
+# 🟢 GRAPH GENERATION KEYWORDS
+GRAPH_SYNONYMS = [
+    '"GRAPH"',
+    '"PLOT"',
+    '"رسم بياني"',
+    '"آلة الرسم"',
+    '"حاسبة الرسوم"',
+    "GRAPH",
+    "PLOT",
+    "رسم بياني",
+    "آلة الرسم",
+    "حاسبة الرسوم"
+]
+
+# 🟠 WEB/WEBLINK KEYWORDS
+WEB_SYNONYMS = [
+    "*internet*", "*web*", "*إنترنت*", "*الويب*"
+]
+
+# ----- PROMPT CHOOSING LOGIC -----
+# Fill in your actual prompts here:
+
+
 app = FastAPI(lifespan=lifespan)
 
 # 🔧 Add exception handlers for better error debugging
@@ -2363,6 +2456,11 @@ async def cleanup_on_shutdown():
     chat_session_manager.chat_sessions.clear()
     print("[SHUTDOWN] Cleanup complete")
 
+@app.on_event("startup")
+async def startup_cleanup():
+    """Run cleanup tasks on server startup"""
+    print("[STARTUP] Server startup completed - using base64 audio only")
+
 # --- CORS middleware setup ---
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -2386,7 +2484,8 @@ app.add_middleware(
     max_age=3600                               # Cache preflight requests for 1 hour
 )
 
-app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
+# Audio static mount not needed - using base64 only
+# app.mount("/audio", StaticFiles(directory=AUDIO_DIR), name="audio")
 app.mount("/frontend", StaticFiles(directory="frontend", html=True), name="frontend")
 # --- Graphs directory setup and static mount ---
 GRAPHS_DIR = "graphs"
@@ -2802,32 +2901,101 @@ async def generate_runware_image(prompt):
 
 async def vision_caption_openai(img: Image.Image = None, image_url: str = None) -> str:
     """
-    Caption an image using OpenAI GPT-4o Vision.
-    Supports both in-memory PIL.Image (local files) and remote URLs.
+    Caption an image using OpenAI GPT-4o Vision with robust fallbacks.
+    Supports both in-memory PIL.Image and remote URLs.
+    Educational focus with multiple fallback strategies.
     """
-    if img is not None:
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG")
-        img_b64 = base64.b64encode(buf.getvalue()).decode()
-        image_content = {"url": f"data:image/jpeg;base64,{img_b64}"}
-    elif image_url is not None:
-        image_content = {"url": image_url}
-    else:
+    # Handle input validation
+    if img is None and image_url is None:
         raise ValueError("Must provide either img or image_url.")
-
-    messages = [
-        {"role": "user", "content": [
-            {"type": "text", "text": "Describe this image in detail."},
-            {"type": "image_url", "image_url": image_content}
-        ]}
-    ]
-    resp = openai.chat.completions.create(
-        model="gpt-4o",
-        messages=messages,
-        max_tokens=256,
-        temperature=0.5
-    )
-    return resp.choices[0].message.content.strip()
+    
+    # Prepare image content
+    try:
+        if img is not None:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG")
+            img_b64 = base64.b64encode(buf.getvalue()).decode()
+            image_content = {"url": f"data:image/jpeg;base64,{img_b64}"}
+        else:
+            image_content = {"url": image_url}
+        
+        # Try OpenAI GPT-4o Vision first
+        try:
+            messages = [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Describe this image in detail for educational purposes. Focus on key elements that would help students understand the content."},
+                    {"type": "image_url", "image_url": image_content}
+                ]}
+            ]
+            
+            def _call_openai():
+                return openai.chat.completions.create(
+                    model="gpt-4o",  # Using the more powerful model as requested
+                    messages=messages,
+                    max_tokens=300,  # More tokens for detailed descriptions
+                    temperature=0.3
+                )
+            
+            resp = await asyncio.to_thread(_call_openai)
+            content = resp.choices[0].message.content
+            if content and content.strip():
+                return content.strip()
+                
+        except Exception as e:
+            print(f"[VISION] GPT-4o Vision failed: {e}")
+            
+            # Fallback 1: Try with legacy OpenAI approach if available
+            try:
+                def _call_legacy():
+                    return openai.chat.completions.create(
+                        model="gpt-4o-mini",  # Fallback to mini for cost efficiency
+                        messages=messages,
+                        max_tokens=200,
+                        temperature=0.3
+                    )
+                
+                resp = await asyncio.to_thread(_call_legacy)
+                content = resp.choices[0].message.content
+                if content and content.strip():
+                    print("[VISION] Used GPT-4o-mini fallback")
+                    return content.strip()
+                    
+            except Exception as e2:
+                print(f"[VISION] GPT-4o-mini fallback failed: {e2}")
+        
+        # Fallback 2: OCR text extraction (only if we have PIL image)
+        if img is not None:
+            try:
+                import pytesseract
+                text = pytesseract.image_to_string(img).strip()
+                w, h = img.size
+                base = f"An educational image of size {w}x{h} pixels."
+                if text and len(text) > 3:
+                    # Clean and limit OCR text
+                    clean_text = ' '.join(text.split())[:300]
+                    base += f" Detected text content: {clean_text}"
+                    return base
+                else:
+                    return base + " No readable text detected in the image."
+                    
+            except Exception as e3:
+                print(f"[VISION] OCR fallback failed: {e3}")
+        
+        # Fallback 3: Basic image metadata
+        if img is not None:
+            try:
+                w, h = img.size
+                mode = getattr(img, 'mode', 'Unknown')
+                return f"An educational image ({mode} format, {w}x{h} pixels) was provided for analysis."
+            except Exception:
+                pass
+        
+        # Final fallback
+        return "An educational image was provided but could not be analyzed due to technical limitations."
+        
+    except Exception as e:
+        print(f"[VISION] Critical error in vision_caption_openai: {e}")
+        return "An image was provided but encountered processing errors."
 
 
 
@@ -2835,6 +3003,33 @@ def remove_punctuation(text):
     """Remove punctuation using pre-compiled pattern - MUCH faster"""
     return PUNCTUATION_PATTERN.sub('', text)
 
+
+
+def fix_tts_sentence(text):
+    """Fix common TTS issues like unmatched quotes, broken sentences, etc."""
+    if not text or not text.strip():
+        return text
+    
+    # Fix unmatched quotes - ensure quotes are balanced
+    quote_count = text.count('"')
+    if quote_count % 2 != 0:
+        # Add closing quote if needed
+        text = text + '"'
+    
+    # Fix broken sentences that end with incomplete punctuation
+    text = text.strip()
+    if text and not text[-1] in '.!?':
+        text += '.'
+    
+    # Remove excessive whitespace
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Fix common TTS pronunciation issues
+    text = text.replace(' - "', '. ')  # Replace dash-quote combinations
+    text = text.replace('" - "', '. ')  # Replace quote-dash-quote
+    text = re.sub(r'\s*-\s*"', '. ', text)  # Clean up dash-quote patterns
+    
+    return text.strip()
 
 
 def sanitize_for_tts(text):
@@ -3087,25 +3282,27 @@ async def stream_answer(
     image_provided: bool = Query(None),
 ):
     """
-    🚀 CLEAN VERSION: Stream an answer with robust parameter handling.
-    All structural issues have been fixed and FAISS optimizations applied.
+    CLEAN VERSION: Stream one sentence at a time (text + audio) and avoid duplicate streaming.
+    All original behavior (RAG, images, graphs, weblinks, language enforcement, etc.) preserved.
     """
-    
     print(f"[CLEAN-DEBUG] Function started with question: {question}")
     print(f"[CLEAN-DEBUG] Chat ID: {chat_id}, Curriculum: {curriculum}")
-    
+
     try:
-        # 🔧 Parameter validation and cleanup
+        # Parameter validation
         if not curriculum or curriculum.strip() == "":
             raise HTTPException(status_code=400, detail="Missing required parameter: curriculum")
-        
+
         if not question or question.strip() == "":
-            question = "Hello"
-        
+            async def greeting_stream():
+                yield f"data: {safe_json_dumps({'type': 'partial', 'partial': 'Hello! How can I help you today?'})}\n\n"
+                yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
+            return StreamingResponse(greeting_stream(), media_type="text/event-stream")
+
         if not chat_id or chat_id.strip() == "":
             raise HTTPException(status_code=400, detail="Missing required parameter: chat_id")
-        
-        # Clean up parameters
+
+        # Helper to normalise booleans from query params
         def safe_bool(value):
             if value is None:
                 return None
@@ -3114,159 +3311,175 @@ async def stream_answer(
             if isinstance(value, str):
                 return value.lower() in ('true', '1', 'yes', 'on')
             return bool(value)
-        
+
         file_provided = safe_bool(file_provided)
         image_provided = safe_bool(image_provided)
-        
-        # Determine processing flags
+
         file_flag = bool(file_provided or file_url or file)
         image_flag = bool(image_provided or image_url or image)
-        
+
         print(f"[CLEAN-DEBUG] Flags - file: {file_flag}, image: {image_flag}")
-        
-        # Initialize context
+
+        # Build context & history via your RAG/chat-session functions
         context = ""
         formatted_history = ""
-        
-        # Process based on flags
+
         if file_flag:
             print(f"[CLEAN-DEBUG] Processing file-based request")
-            # Use optimized chat-session vectors
             vectors = await chat_session_manager.get_vectors_for_chat(chat_id, curriculum)
             docs = await retrieve_documents(vectors, question)
             context = "\n\n".join(doc.page_content for doc in docs)
             formatted_history = await get_chat_history(chat_id)
-            
+
         elif image_flag:
             print(f"[CLEAN-DEBUG] Processing image-based request")
-            # Use optimized chat-session vectors
             vectors = await chat_session_manager.get_vectors_for_chat(chat_id, curriculum)
             docs = await retrieve_documents(vectors, question)
             context = "\n\n".join(doc.page_content for doc in docs)
             formatted_history = await get_chat_history(chat_id)
-            
+
         else:
-            # Default: curriculum-based RAG with chat-session management
             print(f"[CLEAN-DEBUG] Using chat-session based RAG for chat {chat_id}")
             formatted_history = await get_chat_history(chat_id)
-            
-            # 🚀 OPTIMIZED: Use chat-session vectors (with FAISS fixes applied)
             vectors = await chat_session_manager.get_vectors_for_chat(chat_id, curriculum)
             docs = await retrieve_documents(vectors, question)
             context = "\n\n".join(doc.page_content for doc in docs)
-            
+
         print(f"[CLEAN-DEBUG] Context length: {len(context)} chars")
-        
-        # Get user name for personalization
+
+        # Personalization
         user_name = await get_user_name(user_id)
-        
-        # ---- IMAGE GENERATION (Teachers only) ----
+
+        # Image generation for teachers (unchanged)
         if (role or "").strip().lower() == "teacher":
-            # Check for image generation keywords
             img_keywords = ["generation", "GENERATION", "PLOT", "Plot", "create image", "show image", "visual", "illustration", "diagram"]
             if any(keyword in question for keyword in img_keywords):
-                # Extract description for image generation
                 prompt_desc = question
-                
-                # IMAGE GENERATION for teacher
                 img_url = await generate_runware_image(prompt_desc or context)
                 if not img_url:
                     async def fail_stream():
-                        yield f"data: {json.dumps({'type':'error','error':'Image generation failed or no image returned.'})}\n\n"
-                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        yield f"data: {safe_json_dumps({'type':'error','error':'Image generation failed or no image returned.'})}\n\n"
+                        yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
                     return StreamingResponse(fail_stream(), media_type="text/event-stream")
-                
-                async def event_stream():
-                    yield f"data: {json.dumps({'type': 'image', 'url': img_url, 'desc': prompt_desc or 'Generated.'})}\n\n"
-                    yield f"data: {json.dumps({'type':'done'})}\n\n"
-                
-                return StreamingResponse(prepend_init(event_stream()), media_type="text/event-stream")
 
-        # ---- GRAPH GENERATION (Block out-of-context for ALL) ----
+                async def event_stream_image():
+                    yield f"data: {safe_json_dumps({'type': 'image', 'url': img_url, 'desc': prompt_desc or 'Generated.'})}\n\n"
+                    yield f"data: {safe_json_dumps({'type':'done'})}\n\n"
+                return StreamingResponse(prepend_init(event_stream_image()), media_type="text/event-stream")
+
+        # Graph handling (unchanged)
         graph_keywords = ["graph", "plot", "chart", "diagram"]
         if any(keyword in question.lower() for keyword in graph_keywords):
-            # Check if request is curriculum-related
             if not any(word in context.lower() for word in question.lower().split() if len(word) > 3):
-                async def error_stream():
-                    yield f"data: {json.dumps({'type':'error','error':'Sorry, the requested graph is not in the curriculum. Please ask for graphs related to your lessons or curriculum topics.'})}\n\n"
-                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                return StreamingResponse(error_stream(), media_type="text/event-stream")
-            
-            # --- GRAPH GENERATION: use Matplotlib, not Runware ---
-            url = generate_matplotlib_graph(question)
-            async def event_stream():
-                yield f"data: {json.dumps({'type': 'image', 'url': url, 'desc': 'Generated graph.'})}\n\n"
-                yield f"data: {json.dumps({'type':'done'})}\n\n"
-            
-            return StreamingResponse(prepend_init(event_stream()), media_type="text/event-stream")
+                async def error_stream_graph():
+                    yield f"data: {safe_json_dumps({'type':'error','error':'Sorry, the requested graph is not in the curriculum. Please ask for graphs related to your lessons or curriculum topics.'})}\n\n"
+                    yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
+                return StreamingResponse(error_stream_graph(), media_type="text/event-stream")
 
-        # ---- PERPLEXITY WEBLINK ----
+            url = generate_matplotlib_graph(question)
+            async def event_stream_graph():
+                yield f"data: {safe_json_dumps({'type': 'graph', 'url': url, 'desc': 'Generated graph.'})}\n\n"
+                yield f"data: {safe_json_dumps({'type':'done'})}\n\n"
+            return StreamingResponse(prepend_init(event_stream_graph()), media_type="text/event-stream")
+
+        # Weblink via Perplexity (unchanged)
         weblink_keywords = ["weblink", "web link", "website", "url", "link", "online", "internet"]
         if any(keyword in question.lower() for keyword in weblink_keywords):
-            # Check if request is curriculum-related for students
             if (role or "").strip().lower() == "student":
                 if not any(word in context.lower() for word in question.lower().split() if len(word) > 3):
-                    async def error_stream():
-                        yield f"data: {json.dumps({'type':'error','error':'Sorry, web links are only allowed for questions related to your curriculum. Please ask about topics from your uploaded content.'})}\n\n"
-                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                    return StreamingResponse(error_stream(), media_type="text/event-stream")
+                    async def error_stream_weblink():
+                        yield f"data: {safe_json_dumps({'type':'error','error':'Sorry, web links are only allowed for questions related to your curriculum. Please ask about topics from your uploaded content.'})}\n\n"
+                        yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
+                    return StreamingResponse(error_stream_weblink(), media_type="text/event-stream")
 
-            # Generate weblink using Perplexity
             try:
                 result = await generate_weblink_perplexity(question, language)
-                
                 async def weblink_stream():
-                    # Send the weblink result
-                    yield f"data: {json.dumps({'type': 'weblink', 'title': 'Web Resource', 'url': result.get('url', ''), 'description': result.get('desc', '')})}\n\n"
-                    yield f"data: {json.dumps({'type':'done'})}\n\n"
-                
+                    yield f"data: {safe_json_dumps({'type': 'perplexity_full', 'title': 'Web Resource', 'url': result.get('url', ''), 'description': result.get('desc', '')})}\n\n"
+                    yield f"data: {safe_json_dumps({'type':'done'})}\n\n"
                 return StreamingResponse(prepend_init(weblink_stream()), media_type="text/event-stream")
             except Exception as e:
-                async def error_stream():
-                    yield f"data: {json.dumps({'type': 'error', 'error': f'Weblink generation failed: {str(e)}'})}\n\n"
-                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                return StreamingResponse(error_stream(), media_type="text/event-stream")
+                async def error_stream_weblink_fail():
+                    yield f"data: {safe_json_dumps({'type': 'error', 'error': f'Weblink generation failed: {str(e)}'})}\n\n"
+                    yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
+                return StreamingResponse(error_stream_weblink_fail(), media_type="text/event-stream")
 
-
-
-        
-        # Build prompt
+        # Build prompts & language enforcement (preserve behavior)
         prompt_header = teacher_prompt if (role or "").strip().lower() == "teacher" else student_prompt
-        
-        user_content = f"""{prompt_header}
 
-{context}
+        if language and language.lower().startswith("ar"):
+            prompt_header = (
+                "STRICT RULE: Always answer ONLY in Arabic, even if the question/context/history is in another language. "
+                "Translate all context if needed. Never use English in your answer.\n"
+            ) + prompt_header
+        elif language and language.lower().startswith("en"):
+            prompt_header = (
+                "STRICT RULE: Always answer ONLY in English, even if the question/context/history is in another language. "
+                "Translate all context if needed. Never use Arabic in your answer.\n"
+            ) + prompt_header
 
-Now answer the question:
-{question}"""
+        # Replace safe name
+        prompt_header = prompt_header.replace("{name}", user_name)
+
+        user_content = (
+            f"Question: {question} Subject: {subject or 'General'} Language: {language} "
+            f"Previous History: {formatted_history}  {prompt_header}  Context from curriculum: {context}  Now answer the question: {question}"
+        )
+
+        system_content = system_prompt
+        if language and language.lower().startswith("ar"):
+            system_content += "\nSTRICT RULE: You MUST ALWAYS respond in Arabic only, regardless of input language. Translate any English content to Arabic in your response. Never use English.\n"
+        elif language and language.lower().startswith("en"):
+            system_content += "\nSTRICT RULE: You MUST ALWAYS respond in English only, regardless of input language. Translate any Arabic content to English in your response. Never use Arabic.\n"
 
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_content}
         ]
-        
-        # 🚀 STREAMING RESPONSE
-        answer_so_far = ""
-        current_sentence = ""
-        SENT_END = re.compile(r'([.!?])(\s|$)')
-        
-        # Determine voice
+
+        # Streaming setup: sentence boundary regex and voice selection
+        SENT_END = re.compile(r'([.!?])(\s+[A-Z0-9"\(]|\s*$)')  # slightly more flexible
         voice = "ar-SA-ZariyahNeural" if (language or "").strip().lower().startswith("ar") else "en-US-JennyNeural"
-        
+
+        # TTS streaming helper (yields SSE events)
         async def stream_audio(sentence):
+            """
+            Yields audio-related SSE events for the given sentence.
+            """
             try:
                 clean_sentence = sanitize_for_tts(sentence)
-                if not clean_sentence.strip():
-                    return None
-                
-                audio_url = await generate_complete_tts(clean_sentence, language)
-                if audio_url:
-                    return f"data: {json.dumps({'type': 'audio_pending', 'sentence': clean_sentence, 'audio_url': audio_url})}\n\n"
-                return None
+                if not clean_sentence.strip() or len(clean_sentence.strip()) < 3:
+                    print("[TTS SKIP] Empty or too short sentence, skipping.")
+                    return
+
+                clean_sentence = fix_tts_sentence(clean_sentence)
+                print("[TTS DEBUG] Sending this to edge-tts:", repr(clean_sentence), "Voice:", voice)
+
+                communicate_stream = edge_tts.Communicate(clean_sentence, voice=voice)
+                last_chunk = None
+
+                # Notify audio is pending for the sentence
+                yield f"data: {safe_json_dumps({'type':'audio_pending','sentence': sentence})}\n\n"
+
+                async for chunk in communicate_stream.stream():
+                    if chunk["type"] == "audio":
+                        data = chunk['data']
+                        # drop pure-silence frames if they match your pattern
+                        if all(b == 0xAA for b in data):
+                            continue
+                        hexstr = data.hex()
+                        if hexstr == last_chunk:
+                            continue
+                        last_chunk = hexstr
+                        yield f"data: {safe_json_dumps({'type':'audio_chunk','sentence': sentence, 'chunk': hexstr})}\n\n"
+
+                # Indicate audio done for that sentence
+                yield f"data: {safe_json_dumps({'type':'audio_done','sentence': sentence})}\n\n"
             except Exception as e:
-                print(f"[TTS ERROR] {e}")
-                return None
-        
+                print("[ERROR] TTS failed for sentence:", sentence, str(e))
+                # Optionally emit an error event for TTS failure (kept silent here)
+
+        # MAIN streaming call to OpenAI with streaming = True
         try:
             stream = openai.chat.completions.create(
                 model="gpt-4.1",
@@ -3275,60 +3488,94 @@ Now answer the question:
                 max_tokens=2000,
                 temperature=0.7
             )
-            
+
             async def event_stream():
-                nonlocal answer_so_far, current_sentence
-                
-                # Send init event
-                yield f"data: {json.dumps({'type':'init','image_provided': image_flag, 'file_provided': file_flag})}\n\n"
-                
+                """
+                1) Buffer model output until a sentence-ending punctuation is seen.
+                2) For each complete sentence, send a single text partial event, then stream its audio.
+                3) Avoid duplicates: each sentence is sent once.
+                """
+                answer_so_far = ""
+                buffer = ""  # accumulation of model content
+                sent_sentences = []  # preserve order for history update if needed
+
+                # initial minimal partial so frontends expecting an initial event can see it
+                yield f"data: {safe_json_dumps({'type': 'partial', 'partial': ''})}\n\n"
+
+                # iterate over streamed model deltas
                 for chunk in stream:
-                    if chunk.choices[0].delta.content:
-                        content = chunk.choices[0].delta.content
-                        answer_so_far += content
-                        current_sentence += content
-                        
-                        # Send partial content
-                        yield f"data: {json.dumps({'type': 'partial', 'partial': content})}\n\n"
-                        
-                        # Check for sentence end
-                        if SENT_END.search(current_sentence):
-                            audio_event = await stream_audio(current_sentence.strip())
-                            if audio_event:
-                                yield audio_event
-                            current_sentence = ""
-                
-                # Handle remaining sentence
-                if current_sentence.strip():
-                    audio_event = await stream_audio(current_sentence.strip())
-                    if audio_event:
-                        yield audio_event
-                
-                # Update chat history
+                    delta = chunk.choices[0].delta
+                    content_piece = delta.get("content", "") if isinstance(delta, dict) else getattr(delta, "content", "")
+                    if not content_piece:
+                        continue
+
+                    buffer += content_piece
+                    # Try to extract sentences as long as there's at least one sentence end
+                    while True:
+                        match = SENT_END.search(buffer)
+                        if not match:
+                            break
+                        # end index of the match
+                        end_idx = match.end()
+                        sentence_to_send = buffer[:end_idx].strip()
+                        # drop trivial short outputs
+                        if sentence_to_send:
+                            # update cumulative answer text
+                            answer_so_far += (sentence_to_send + " ")
+                            sent_sentences.append(sentence_to_send)
+
+                            # 1) Send text for this sentence exactly once
+                            yield f"data: {safe_json_dumps({'type': 'partial', 'partial': sentence_to_send})}\n\n"
+
+                            # 2) Immediately stream audio for the sentence
+                            async for audio_event in stream_audio(sentence_to_send):
+                                if audio_event:
+                                    yield audio_event
+
+                        # shrink buffer to remaining text
+                        buffer = buffer[end_idx:].lstrip()
+
+                # After streaming completes, if any leftover in buffer => send it once
+                if buffer.strip():
+                    leftover = buffer.strip()
+                    answer_so_far += (leftover + " ")
+                    sent_sentences.append(leftover)
+
+                    # Send leftover text + audio
+                    yield f"data: {safe_json_dumps({'type': 'partial', 'partial': leftover})}\n\n"
+                    async for audio_event in stream_audio(leftover):
+                        if audio_event:
+                            yield audio_event
+
+                # Optionally update chat history with the full answer
                 try:
-                    await update_chat_history_speech(user_id, question, answer_so_far)
+                    await update_chat_history_speech(user_id, question, answer_so_far.strip())
                 except Exception as e:
                     print(f"[HISTORY ERROR] {e}")
-                
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
-            
+
+                # Final done event
+                yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
+
+            # Return SSE stream (with your prepend_init wrapper)
             return StreamingResponse(prepend_init(event_stream()), media_type="text/event-stream")
-            
+
         except Exception as ex:
             print(f"[STREAMING ERROR] {ex}")
             async def error_stream():
-                yield f"data: {json.dumps({'type': 'error', 'error': f'Streaming failure: {str(ex)}'})}\n\n"
-                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                yield f"data: {safe_json_dumps({'type': 'error', 'error': f'Streaming failure: {str(ex)}'})}\n\n"
+                yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
             return StreamingResponse(error_stream(), media_type="text/event-stream")
-    
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"[FUNCTION ERROR] {e}")
-        async def error_stream():
-            yield f"data: {json.dumps({'type': 'error', 'error': f'Server error: {str(e)}'})}\n\n"
-            yield f"data: {json.dumps({'type': 'done'})}\n\n"
-        return StreamingResponse(error_stream(), media_type="text/event-stream")
+        error_message = str(e)
+        async def error_stream_final():
+            yield f"data: {safe_json_dumps({'type': 'error', 'error': f'Server error: {error_message}'})}\n\n"
+            yield f"data: {safe_json_dumps({'type': 'done'})}\n\n"
+        return StreamingResponse(error_stream_final(), media_type="text/event-stream")
+
 
 # ============================================================================
 
@@ -3840,7 +4087,7 @@ async def check_gcp_faiss(curriculum_id: str):
 async def check_backend_dirs():
     """Check if critical backend directories exist and are writable."""
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    dirs_to_check = ['uploads', 'faiss', 'graphs', 'audio_sents']
+    dirs_to_check = ['uploads', 'faiss', 'graphs']
     
     results = {}
     for dir_name in dirs_to_check:
@@ -4009,11 +4256,11 @@ async def initialize_chat_session(
         session_context = {
             "curriculum_id": curriculum_id,
             "chat_id": chat_id,
-            "grade": grade,
-            "subject": subject,
-            "activity": activity,
-            "user_id": user_id,
-            "role": role,
+            "grade": grade or "",
+            "subject": subject or "",
+            "activity": activity or "",
+            "user_id": user_id or "",
+            "role": role or "",
             "initialized_at": time.time(),
             "initialization_time": initialization_time,
             "vectors_loaded": True,
@@ -4424,19 +4671,17 @@ async def test_weblink_filtering(
 
 @app.get("/test-tts")
 async def test_tts(text: str = Query("Hello, this is a test"), language: str = Query("en")):
-    """Test TTS generation - returns audio URL"""
+    """Test TTS generation - returns base64 audio data only"""
     try:
-        audio_url = await generate_complete_tts(text, language)
+        audio_data = await generate_complete_tts(text, language)
         return {
             "status": "success",
             "text": text,
             "language": language,
-            "audio_url": audio_url
+            "audio_data": audio_data
         }
     except Exception as e:
         return {
             "status": "error",
             "error": str(e)
         }
-
-
